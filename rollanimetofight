@@ -1,5 +1,7 @@
+--!nocheck
+
 local TARGET_GAME_ID = 10298144467
-local SCRIPT_VERSION = "0.1.22"
+local SCRIPT_VERSION = "0.1.23"
 local GAME_TITLE = "Roll Anime to Fight!"
 local LIBRARY_URL = "https://raw.githubusercontent.com/hydrahubb/hydra/refs/heads/main/library"
 
@@ -589,6 +591,7 @@ Hydra:CreateUniversalInfo(Window, {
 	},
 	VersionLabel = GAME_TITLE .. " v" .. SCRIPT_VERSION,
 	Changelog = {
+		"Fixed saved-config autoload",
 		"Added server-synced auto summon timing",
 		"Added owned-plot positioning and range recovery",
 		"Added filtered auto buy with cheapest-match defaults",
@@ -692,19 +695,13 @@ Menu:AddButton({ Name = "Unload Hydra", ButtonText = "UNLOAD", Danger = true, Ca
 
 local Configuration = Settings:AddSection("Configuration", { Side = "Right", Icon = "Folder" })
 local ConfigDirectory = "hydra/configs/roll-anime-to-fight"
-local ConfigManager = Hydra:CreateConfigManager(Configuration, {
+Hydra:CreateConfigManager(Configuration, {
 	Directory = ConfigDirectory,
 	DefaultName = "default",
 	FlagPrefix = "rollAnime.config",
 	IgnoreFlags = { "webhook.url" },
+	AutoLoad = not SkipAutoload,
 })
-
-if not SkipAutoload then
-	task.spawn(function()
-		local ok, _, name = Hydra:LoadAutoloadConfig(ConfigDirectory, { IgnoreFlags = ConfigManager.IgnoreFlags })
-		if ok then notify("Autoload complete", name) end
-	end)
-end
 
 task.spawn(function()
 	while Runtime.Alive do
