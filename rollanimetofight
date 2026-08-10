@@ -1,5 +1,3 @@
---!nocheck
-
 local TARGET_GAME_ID = 10298144467
 local SCRIPT_VERSION = "0.1.22"
 local GAME_TITLE = "Roll Anime to Fight!"
