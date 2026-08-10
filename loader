@@ -1,3 +1,5 @@
+--!nocheck
+
 if not game:IsLoaded() then
 	game.Loaded:Wait()
 end
@@ -15,7 +17,11 @@ if not payloadUrl then
 	return
 end
 
-local fetchSuccess, source = pcall(game.HttpGet, game, payloadUrl)
+local separator = string.find(payloadUrl, "?", 1, true) and "&" or "?"
+local freshPayloadUrl = payloadUrl .. separator .. "hydra_cache=" .. tostring(DateTime.now().UnixTimestampMillis)
+local fetchSuccess, source = pcall(function()
+	return game:HttpGet(freshPayloadUrl, true)
+end)
 if not fetchSuccess then
 	warn("Hydra failed to fetch the supported-game payload: " .. tostring(source))
 	return
