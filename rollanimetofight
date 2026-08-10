@@ -1,5 +1,7 @@
+--!nocheck
+
 local TARGET_GAME_ID = 10298144467
-local SCRIPT_VERSION = "0.1.14"
+local SCRIPT_VERSION = "0.1.22"
 local GAME_TITLE = "Roll Anime to Fight!"
 local LIBRARY_URL = "https://raw.githubusercontent.com/hydrahubb/hydra/refs/heads/main/library"
 
@@ -32,22 +34,29 @@ local Runtime = {
 	NextRollAt = 0,
 	LastRoll = nil,
 	ProcessedRolls = {},
-	PendingSkills = {},
 	PendingSell = {},
 	TravelLocks = 0,
 	LocalPlot = nil,
 	SummonStage = "Idle",
+	SummonPositioned = false,
+	SummonWasEnabled = false,
+	RollStage = "Idle",
+	LastBuyStatus = "Idle",
+	LastAntiAfkStatus = "Idle",
 	Stats = {
 		SummonAttempts = 0,
 		SummonRetries = 0,
 		SummonFailures = 0,
 		Rolls = 0,
+		RollHandlerFailures = 0,
 		UnitsSeen = 0,
 		BuyAttempts = 0,
+		BuyMatches = 0,
+		BuyFailures = 0,
 		Purchases = 0,
 		SellBatches = 0,
-		FightStarts = 0,
-		SkillsUsed = 0,
+		AntiAfkPulses = 0,
+		AntiAfkFailures = 0,
 	},
 }
 
@@ -98,12 +107,25 @@ local RollRemote = CharacterRemotes:WaitForChild("Roll")
 local BuyRemote = CharacterRemotes:WaitForChild("Buy")
 local InventoryRemote = CharacterRemotes:WaitForChild("UpdateInventory")
 local SellRemote = CharacterRemotes:WaitForChild("Sell")
-local ActiveSkillRemote = CharacterRemotes:WaitForChild("ActiveSkill")
-local FightRemote = Remotes:WaitForChild("Fight"):WaitForChild("Start")
 local UpgradeRemote = Remotes:WaitForChild("Upgrade")
 local SettingsRemote = Remotes:WaitForChild("Settings")
-local CheckpointRemote = Remotes:WaitForChild("Checkpoint")
 local ItemUseRemote = Remotes:WaitForChild("Items"):WaitForChild("Use")
+
+local function disableStaleHydraConnections(signal)
+	if type(getconnections) ~= "function" or not debug or type(debug.info) ~= "function" then return end
+	for _, connection in ipairs(getconnections(signal)) do
+		local source = ""
+		if type(connection.Function) == "function" then
+			pcall(function() source = debug.info(connection.Function, "s") end)
+		end
+		if source == "Hydra/RollAnimeToFight" and connection.Disable then
+			pcall(function() connection:Disable() end)
+		end
+	end
+end
+
+disableStaleHydraConnections(RollRemote.OnClientEvent)
+disableStaleHydraConnections(BuyRemote.OnClientEvent)
 
 local rarityOrder = { "Common", "Rare", "Epic", "Legendary", "Mythic", "Secret", "God", "Limited" }
 local rarityRank = {}
@@ -202,12 +224,6 @@ local function serverSummonCooldown()
 	return hasFastSummon() and 0.6 or 2.2
 end
 
-local function summonCooldown()
-	local serverMinimum = serverSummonCooldown()
-	if flag("summon.matchCooldown", true) then return serverMinimum end
-	return math.max(serverMinimum, numberFlag("summon.delay", 2.2))
-end
-
 local function isFighting()
 	return LocalPlayer:GetAttribute("FightRunning") == true
 end
@@ -241,35 +257,28 @@ local function getSummonPrompt()
 	return prompt and prompt:IsA("ProximityPrompt") and prompt or nil
 end
 
-local function getSummonSpawn()
-	local plot = getPlayerPlot()
-	local misc = plot and plot:FindFirstChild("Misc")
-	local spawn = misc and misc:FindFirstChild("Spawn")
-	if spawn and (spawn:IsA("Attachment") or spawn:IsA("BasePart")) then return spawn end
-end
-
-local function moveIntoSummonRange(prompt)
+local function moveIntoSummonRange(prompt, forcePosition)
 	Runtime.SummonStage = "ResolveMovement"
 	local character = LocalPlayer.Character
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	local button = prompt.Parent
-	local spawn = getSummonSpawn()
-	if not root or not button or not button:IsA("BasePart") or not spawn then return false, "summon spawn unavailable" end
-	if (root.Position - button.Position).Magnitude <= math.max(1, prompt.MaxActivationDistance - 0.5) then
+	if not root or not button or not button:IsA("BasePart") then return false, "summon podium unavailable" end
+	local distance = (root.Position - button.Position).Magnitude
+	if not forcePosition and distance <= math.max(1, prompt.MaxActivationDistance - 0.5) then
 		Runtime.SummonStage = "InRange"
 		return true
 	end
 
-	local spawnPosition = spawn:IsA("Attachment") and spawn.WorldPosition or spawn.Position
-	local target = spawnPosition + Vector3.new(0, 3, 0)
-	local offset = button.Position - target
-	local safeRange = math.max(2, prompt.MaxActivationDistance - 2)
-	if offset.Magnitude > safeRange then target += offset.Unit * (offset.Magnitude - safeRange) end
+	local forward = Vector3.new(button.CFrame.LookVector.X, 0, button.CFrame.LookVector.Z)
+	if forward.Magnitude < 0.01 then forward = Vector3.new(0, 0, -1) else forward = forward.Unit end
+	local target = button.Position + forward * 2 + Vector3.new(0, 3, 0)
 	local facing = Vector3.new(button.Position.X, target.Y, button.Position.Z)
 	root.CFrame = CFrame.lookAt(target, facing)
 	task.wait(0.12)
 	Runtime.SummonStage = "Positioned"
-	return (root.Position - button.Position).Magnitude <= prompt.MaxActivationDistance, "summon prompt remained out of range"
+	local positioned = (root.Position - button.Position).Magnitude <= prompt.MaxActivationDistance
+	Runtime.SummonPositioned = positioned
+	return positioned, "summon prompt remained out of range"
 end
 
 local function fireSummonPrompt()
@@ -277,23 +286,15 @@ local function fireSummonPrompt()
 	local prompt = getSummonPrompt()
 	if not prompt or not prompt.Enabled then return false, "summon prompt unavailable" end
 	Runtime.SummonStage = "MoveIntoRange"
-	local positioned, positionProblem = moveIntoSummonRange(prompt)
+	local positioned, positionProblem = moveIntoSummonRange(prompt, not Runtime.SummonPositioned)
 	if not positioned then return false, positionProblem end
 	Runtime.SummonStage = "IncrementAttempt"
 	Runtime.Stats.SummonAttempts += 1
 
-	if type(fireproximityprompt) == "function" then
-		Runtime.SummonStage = "FirePrompt"
-		local ok, problem = pcall(fireproximityprompt, prompt, 0)
-		if ok then Runtime.SummonStage = "Triggered" return true end
-		Runtime.Stats.SummonFailures += 1
-		return false, problem
-	end
-
 	local ok, problem = pcall(function()
 		Runtime.SummonStage = "HoldBegin"
 		prompt:InputHoldBegin()
-		task.wait(math.max(0.12, prompt.HoldDuration + 0.05))
+		task.wait(math.max(0.08, prompt.HoldDuration + 0.03))
 		prompt:InputHoldEnd()
 	end)
 	if ok then Runtime.SummonStage = "Triggered" Runtime.Stats.SummonRetries += 1 else Runtime.Stats.SummonFailures += 1 end
@@ -304,64 +305,16 @@ function Runtime:SummonOnce()
 	return fireSummonPrompt()
 end
 
-local function hasLivingBoss()
-	local plot = getPlayerPlot()
-	local enemies = plot and plot:FindFirstChild("Enemies")
-	if not enemies then return false end
-	for _, enemy in ipairs(enemies:GetChildren()) do
-		local kind = enemy:GetAttribute("EnemyType") or enemy:GetAttribute("Type")
-		local health = tonumber(enemy:GetAttribute("Remaining")) or tonumber(enemy:GetAttribute("Health")) or 0
-		if (kind == "Boss" or string.find(string.lower(enemy.Name), "boss", 1, true)) and health > 0 then return true end
-	end
-	return false
-end
-
 local function ensureSetting(name, desired)
 	desired = desired == true
 	local current = DataService:get({ "Settings", name }) == true
 	if current ~= desired then SettingsRemote:FireServer(name) end
 end
 
-local function ensureAutoPlay(desired)
-	desired = desired == true
-	if (LocalPlayer:GetAttribute("FightAutoPlay") == true) ~= desired then FightRemote:FireServer("AutoPlay") end
-end
-
 local function applyExecutorFpsLimit(enabled)
 	if type(setfpscap) ~= "function" then return end
 	local target = enabled and math.clamp(math.floor(numberFlag("performance.fps", 120)), 30, 240) or OriginalFpsCap
 	pcall(setfpscap, target)
-end
-
-local fastForwardToken = 0
-local function setFastForward(target)
-	target = math.clamp(math.floor(tonumber(target) or 1), 1, 2)
-	fastForwardToken += 1
-	local token = fastForwardToken
-	task.spawn(function()
-		for _ = 1, 2 do
-			if not Runtime.Alive or token ~= fastForwardToken then return end
-			local current = math.clamp(math.floor(tonumber(LocalPlayer:GetAttribute("FightFastForwardLevel")) or 1), 1, 2)
-			if current == target then return end
-			FightRemote:FireServer("FastForward")
-			task.wait(0.3)
-		end
-	end)
-end
-
-local checkpointToken = 0
-local function setCheckpoint(target)
-	target = tonumber(target) or 0
-	checkpointToken += 1
-	local token = checkpointToken
-	task.spawn(function()
-		for _ = 1, 7 do
-			if not Runtime.Alive or token ~= checkpointToken then return end
-			if (tonumber(DataService:get({ "Settings", "Checkpoint" })) or 0) == target then return end
-			CheckpointRemote:FireServer()
-			task.wait(0.35)
-		end
-	end)
 end
 
 local function requestFunction()
@@ -413,17 +366,19 @@ local function entryMatches(entry, availableGold)
 end
 
 local function processRollPurchases(roll)
-	if not Runtime.Alive or not flag("buy.enabled", false) then return end
-	local rollKey = tostring(roll.Id)
+	if not Runtime.Alive or not flag("buy.enabled", false) then Runtime.LastBuyStatus = "Disabled" return end
+	local rollKey = tostring(roll.Id or roll.ReceivedAt)
 	if Runtime.ProcessedRolls[rollKey] then return end
 	Runtime.ProcessedRolls[rollKey] = true
-	if flag("buy.stopFull", true) and inventoryFull(numberFlag("buy.inventoryBuffer", 0)) then return end
+	if flag("buy.stopFull", true) and inventoryFull(numberFlag("buy.inventoryBuffer", 0)) then Runtime.LastBuyStatus = "InventoryFull" return end
 
 	local availableGold = getGold()
 	local matches = {}
 	for index, entry in pairs(roll.Entries) do
 		if entryMatches(entry, availableGold) then table.insert(matches, { Index = index, Entry = entry }) end
 	end
+	Runtime.Stats.BuyMatches += #matches
+	if #matches == 0 then Runtime.LastBuyStatus = "NoMatches" return end
 	local mode = flag("buy.mode", "All Matches")
 	if mode == "Rarest Match" then
 		table.sort(matches, function(a, b) return (rarityRank[entryRarity(a.Entry)] or 0) > (rarityRank[entryRarity(b.Entry)] or 0) end)
@@ -436,34 +391,63 @@ local function processRollPurchases(roll)
 		if not Runtime.Alive or Runtime.LastRoll ~= roll then return end
 		local price = tonumber(match.Entry.Price) or 0
 		if entryMatches(match.Entry, availableGold) then
-			BuyRemote:FireServer(roll.Id, match.Index)
-			Runtime.Stats.BuyAttempts += 1
-			availableGold -= price
+			Runtime.LastBuyStatus = "Requesting:" .. tostring(match.Entry.Name)
+			local requestOk, requestProblem = pcall(function() BuyRemote:FireServer(roll.Id, match.Index) end)
+			if requestOk then
+				Runtime.Stats.BuyAttempts += 1
+				availableGold -= price
+			else
+				Runtime.Stats.BuyFailures += 1
+				Runtime.LastBuyStatus = "RequestFailed:" .. tostring(requestProblem)
+			end
 			task.wait(0.12)
 		end
 	end
 end
 
 Runtime:Add(RollRemote.OnClientEvent:Connect(function(player, plot, entries, movementTime, rollId)
-	if player ~= LocalPlayer or type(entries) ~= "table" then return end
-	local roll = { Id = rollId, Entries = entries, Plot = plot, ReceivedAt = os.clock() }
-	Runtime.LastRoll = roll
-	Runtime.Stats.Rolls += 1
-	for _ in pairs(entries) do Runtime.Stats.UnitsSeen += 1 end
-	local cooldown = summonCooldown()
-	Runtime.NextRollAt = os.clock() + cooldown + (flag("buy.enabled", false) and 0.35 or 0.05)
-	task.delay(serverSummonCooldown() + 0.03, function() processRollPurchases(roll) end)
+	local ok, problem = xpcall(function()
+		Runtime.RollStage = "Validate"
+		if player ~= LocalPlayer or type(entries) ~= "table" then return end
+		Runtime.RollStage = "CreateRoll"
+		local roll = { Id = rollId, Entries = entries, Plot = plot, ReceivedAt = os.clock() }
+		Runtime.LastRoll = roll
+		Runtime.Stats.Rolls += 1
+		Runtime.RollStage = "CountUnits"
+		for _ in pairs(entries) do Runtime.Stats.UnitsSeen += 1 end
+		Runtime.RollStage = "ScheduleNext"
+		local cooldown = serverSummonCooldown()
+		Runtime.NextRollAt = os.clock() + cooldown + 0.03
+		Runtime.RollStage = "SchedulePurchases"
+		task.spawn(function()
+			task.wait(cooldown + 0.03)
+			local purchaseOk, purchaseProblem = xpcall(function()
+				processRollPurchases(roll)
+			end, function(reason) return debug.traceback(tostring(reason), 2) end)
+			if not purchaseOk then
+				Runtime.Stats.BuyFailures += 1
+				warn("Hydra purchase worker recovered: " .. tostring(purchaseProblem))
+			end
+		end)
 
 	if flag("webhook.rolls", false) then
 		local lines = {}
 		for _, entry in pairs(entries) do table.insert(lines, entryRarity(entry) .. " • " .. tostring(entry.Name) .. " • $" .. tostring(entry.Price or 0)) end
 		sendWebhook("Summon roll", table.concat(lines, "\n"))
 	end
+		Runtime.RollStage = "Complete"
+	end, function(reason) return debug.traceback(tostring(reason), 2) end)
+	if not ok then
+		Runtime.Stats.RollHandlerFailures += 1
+		warn("Hydra roll handler recovered (" .. tostring(Runtime.RollStage) .. "): " .. tostring(problem))
+	end
+	return true
 end))
 
 Runtime:Add(BuyRemote.OnClientEvent:Connect(function(player, rollId, index)
 	if player ~= LocalPlayer then return end
 	Runtime.Stats.Purchases += 1
+	Runtime.LastBuyStatus = "Purchased"
 	local roll = Runtime.LastRoll
 	local entry = roll and tostring(roll.Id) == tostring(rollId) and roll.Entries[index]
 	if entry and flag("webhook.purchases", true) then
@@ -472,6 +456,7 @@ Runtime:Add(BuyRemote.OnClientEvent:Connect(function(player, rollId, index)
 			{ name = "Price", value = "$" .. tostring(entry.Price or 0), inline = true },
 		})
 	end
+	return true
 end))
 
 local function protectedInventoryItem(item)
@@ -523,30 +508,6 @@ local function autoLockStep()
 	end
 end
 
-local function skillStep()
-	if not flag("skills.enabled", false) or not isFighting() then return end
-	if flag("skills.bossOnly", false) and not hasLivingBoss() then return end
-	local plot = getPlayerPlot()
-	local characters = plot and plot:FindFirstChild("Characters")
-	if not characters then return end
-	local now = workspace:GetServerTimeNow()
-	local candidates = characters:GetChildren()
-	table.sort(candidates, function(a, b) return (tonumber(a:GetAttribute("Slot")) or 99) < (tonumber(b:GetAttribute("Slot")) or 99) end)
-	for _, model in ipairs(candidates) do
-		local uuid = tostring(model:GetAttribute("UUID") or "")
-		local name = tostring(model:GetAttribute("CharacterName") or model.Name)
-		local cooldownEnd = tonumber(model:GetAttribute("ActiveSkillCooldownEnd")) or 0
-		if uuid ~= "" and cooldownEnd <= now and (Runtime.PendingSkills[uuid] or 0) <= os.clock() then
-			if selectionEmpty("skills.characters") or selected("skills.characters", name) then
-				ActiveSkillRemote:FireServer(uuid)
-				Runtime.PendingSkills[uuid] = os.clock() + math.max(0.5, numberFlag("skills.interval", 0.75))
-				Runtime.Stats.SkillsUsed += 1
-				return
-			end
-		end
-	end
-end
-
 local upgradeMaximums = { Gold = 25, Luck = 25, Slots = 12, Inventory = 225 }
 local upgradeNames = { "Gold", "Luck", "Slots", "Inventory" }
 local function upgradeStep()
@@ -587,12 +548,35 @@ Runtime:Add(LocalPlayer:GetAttributeChangedSignal("FightRunning"):Connect(functi
 	end
 end))
 
+function Runtime:AntiAfkPulse()
+	if not flag("settings.antiAfk", true) then
+		self.LastAntiAfkStatus = "Disabled"
+		return false, "anti-afk disabled"
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		self.Stats.AntiAfkFailures += 1
+		self.LastAntiAfkStatus = "NoCamera"
+		return false, "camera unavailable"
+	end
+	local ok, problem = pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:Button2Down(Vector2.new(0, 0), camera.CFrame)
+		task.wait(0.1)
+		VirtualUser:Button2Up(Vector2.new(0, 0), camera.CFrame)
+	end)
+	if ok then
+		self.Stats.AntiAfkPulses += 1
+		self.LastAntiAfkStatus = "Pulsed"
+	else
+		self.Stats.AntiAfkFailures += 1
+		self.LastAntiAfkStatus = "Failed:" .. tostring(problem)
+	end
+	return ok, problem
+end
+
 Runtime:Add(LocalPlayer.Idled:Connect(function()
-	if not flag("settings.antiAfk", true) then return end
-	VirtualUser:CaptureController()
-	VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-	task.wait(0.1)
-	VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+	Runtime:AntiAfkPulse()
 end))
 
 local Window = Hydra:CreateWindow({ Title = "Hydra", Subtitle = GAME_TITLE, ToggleKey = Enum.KeyCode.RightShift })
@@ -602,47 +586,30 @@ Hydra:CreateUniversalInfo(Window, {
 	Features = {
 		"Smart summoning and filtered purchases",
 		"Inventory protection, locking, and selling",
-		"Fight, checkpoint, and skill automation",
+		"Owned-plot positioning and range recovery",
 		"Upgrades, items, and performance controls",
 	},
 	VersionLabel = GAME_TITLE .. " v" .. SCRIPT_VERSION,
 	Changelog = {
-		"Initial game support",
-		"Server-cooldown summon scheduler",
-		"Filtered auto buy and inventory rules",
-		"Reusable configs with autoload",
-		"Stable section expansion and clean modals",
-		"Exact-height Info sections and unclipped selectors",
+		"Added server-synced auto summon timing",
+		"Added owned-plot positioning and range recovery",
+		"Added filtered auto buy with cheapest-match defaults",
+		"Added inventory protection, auto sell, and team tools",
+		"Added automatic upgrades and usable-item controls",
+		"Added executor-aware Anti-AFK and performance controls",
+		"Hardened repeated loader execution and stale event cleanup",
+		"Removed Fight and Skills controls",
 	},
 })
 
 local Automation = Window:AddTab("Automation", "Automation")
 local Summon = Automation:AddSubTab("Summon", "Summon")
-local Fight = Automation:AddSubTab("Fight", "Fight")
-local Skills = Automation:AddSubTab("Skills", "Fight")
 local Performance = Automation:AddSubTab("Performance", "Performance")
 
 local SummonControls = Summon:AddSection("Auto Summon", { Side = "Left", Icon = "Summon" })
 SummonControls:AddToggle({ Name = "Auto Summon", Flag = "summon.enabled", Default = false })
-SummonControls:AddToggle({ Name = "Match Server Cooldown", Flag = "summon.matchCooldown", Default = true })
-SummonControls:AddSlider({ Name = "Custom Delay", Flag = "summon.delay", Min = 0.6, Max = 10, Step = 0.1, Default = 2.2, Suffix = "s" })
 SummonControls:AddToggle({ Name = "Pause While Fighting", Flag = "summon.pauseWhileFighting", Default = true })
 SummonControls:AddToggle({ Name = "Stop Near Inventory Cap", Flag = "summon.stopFull", Default = true })
-
-local FightControls = Fight:AddSection("Fight Control", { Side = "Left", Icon = "Fight" })
-FightControls:AddToggle({ Name = "Game Auto Play", Flag = "fight.autoPlay", Default = false, Callback = ensureAutoPlay })
-FightControls:AddToggle({ Name = "Fallback Auto Start", Flag = "fight.autoStart", Default = false })
-FightControls:AddSlider({ Name = "Start Delay", Flag = "fight.startDelay", Min = 0.5, Max = 10, Step = 0.1, Default = 2, Suffix = "s" })
-FightControls:AddInput({ Name = "Stop At Wave (0 = off)", Flag = "fight.stopWave", Default = "0", Finished = true })
-FightControls:AddDropdown({ Name = "Checkpoint", Flag = "fight.checkpoint", Values = { "0", "25", "50", "75", "100", "125", "150" }, Default = "0", Callback = setCheckpoint })
-FightControls:AddSlider({ Name = "Fast Forward", Flag = "fight.fastForward", Min = 1, Max = 2, Step = 1, Default = 1, Suffix = "x", Callback = setFastForward })
-
-local SkillControls = Skills:AddSection("Active Skills", { Side = "Left", Icon = "Fight" })
-SkillControls:AddToggle({ Name = "Auto Active Skills", Flag = "skills.enabled", Default = false })
-SkillControls:AddToggle({ Name = "Bosses Only", Flag = "skills.bossOnly", Default = false })
-SkillControls:AddSlider({ Name = "Activation Interval", Flag = "skills.interval", Min = 0.5, Max = 5, Step = 0.1, Default = 0.75, Suffix = "s" })
-SkillControls:AddMultiDropdown({ Name = "Selected Characters", Flag = "skills.characters", Values = characterNames, Default = {} })
-SkillControls:AddToggle({ Name = "Game Auto Ability", Flag = "skills.gameAutoAbility", Default = false, Callback = function(value) ensureSetting("AutoAbility", value) end })
 
 local PerformanceControls = Performance:AddSection("Performance", { Side = "Left", Icon = "Performance" })
 PerformanceControls:AddToggle({ Name = "FPS Boost", Flag = "performance.fpsBoost", Default = false, Callback = function(value) ensureSetting("FPSBoost", value) end })
@@ -658,7 +625,7 @@ end })
 local AutoBuy = Window:AddTab("Auto Buy", "Cart")
 local BuyRules = AutoBuy:AddSection("Purchase Rules", { Side = "Left", Icon = "Cart" })
 BuyRules:AddToggle({ Name = "Auto Buy", Flag = "buy.enabled", Default = false })
-BuyRules:AddDropdown({ Name = "Buy Mode", Flag = "buy.mode", Values = { "All Matches", "Rarest Match", "Cheapest Match" }, Default = "All Matches" })
+BuyRules:AddDropdown({ Name = "Buy Mode", Flag = "buy.mode", Values = { "All Matches", "Rarest Match", "Cheapest Match" }, Default = "Cheapest Match" })
 BuyRules:AddInput({ Name = "Minimum Price", Flag = "buy.minPrice", Default = "0", Finished = true })
 BuyRules:AddInput({ Name = "Maximum Price (0 = any)", Flag = "buy.maxPrice", Default = "0", Finished = true })
 BuyRules:AddInput({ Name = "Keep Gold", Flag = "buy.keepGold", Default = "0", Finished = true })
@@ -666,7 +633,7 @@ BuyRules:AddToggle({ Name = "Stop When Inventory Full", Flag = "buy.stopFull", D
 BuyRules:AddSlider({ Name = "Inventory Buffer", Flag = "buy.inventoryBuffer", Min = 0, Max = 20, Step = 1, Default = 1 })
 
 local BuyFilters = AutoBuy:AddSection("Filters", { Side = "Right", Icon = "List" })
-BuyFilters:AddMultiDropdown({ Name = "Rarities", Flag = "buy.rarities", Values = rarityOrder, Default = { "Legendary", "Mythic", "Secret", "God", "Limited" } })
+BuyFilters:AddMultiDropdown({ Name = "Rarities", Flag = "buy.rarities", Values = rarityOrder, Default = {} })
 BuyFilters:AddMultiDropdown({ Name = "Characters", Flag = "buy.characters", Values = characterNames, Default = {} })
 BuyFilters:AddMultiDropdown({ Name = "Mutations", Flag = "buy.mutations", Values = mutationNames, Default = {} })
 
@@ -744,12 +711,19 @@ end
 task.spawn(function()
 	while Runtime.Alive do
 		local workerOk, workerProblem = xpcall(function()
-			if flag("summon.enabled", false) then
+			local summonEnabled = flag("summon.enabled", false)
+			if summonEnabled and not Runtime.SummonWasEnabled then
+				Runtime.SummonWasEnabled = true
+				Runtime.SummonPositioned = false
+			elseif not summonEnabled then
+				Runtime.SummonWasEnabled = false
+			end
+			if summonEnabled then
 				local blocked = Runtime:IsTravelBusy()
 				blocked = blocked or (flag("summon.pauseWhileFighting", true) and isFighting())
 				blocked = blocked or (flag("summon.stopFull", true) and inventoryFull(numberFlag("buy.inventoryBuffer", 0)))
 				if not blocked and os.clock() >= Runtime.NextRollAt then
-					Runtime.NextRollAt = os.clock() + summonCooldown() + (flag("buy.enabled", false) and 0.35 or 0.05)
+					Runtime.NextRollAt = os.clock() + serverSummonCooldown() + 0.03
 					local ok, problem = fireSummonPrompt()
 					if not ok then
 						Runtime.NextRollAt = os.clock() + 1
@@ -765,27 +739,6 @@ task.spawn(function()
 		end
 		task.wait(0.1)
 	end
-end)
-
-task.spawn(function()
-	local nextStart = 0
-	while Runtime.Alive do
-		local stopWave = math.max(0, numberFlag("fight.stopWave", 0))
-		local wave = tonumber(LocalPlayer:GetAttribute("FightWave")) or 0
-		if stopWave > 0 and isFighting() and wave >= stopWave then
-			FightRemote:FireServer("Stop")
-			nextStart = os.clock() + 5
-		elseif flag("fight.autoStart", false) and not isFighting() and os.clock() >= nextStart then
-			FightRemote:FireServer("Start")
-			Runtime.Stats.FightStarts += 1
-			nextStart = os.clock() + math.max(0.5, numberFlag("fight.startDelay", 2))
-		end
-		task.wait(0.25)
-	end
-end)
-
-task.spawn(function()
-	while Runtime.Alive do skillStep() task.wait(math.max(0.2, numberFlag("skills.interval", 0.75))) end
 end)
 
 task.spawn(function()
