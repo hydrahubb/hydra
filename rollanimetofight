@@ -1,7 +1,7 @@
 --!nocheck
 
 local TARGET_GAME_ID = 10298144467
-local SCRIPT_VERSION = "0.1.23"
+local SCRIPT_VERSION = "0.1.24"
 local GAME_TITLE = "Roll Anime to Fight!"
 local LIBRARY_URL = "https://raw.githubusercontent.com/hydrahubb/hydra/refs/heads/main/library"
 
@@ -263,16 +263,18 @@ local function moveIntoSummonRange(prompt, forcePosition)
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	local button = prompt.Parent
 	if not root or not button or not button:IsA("BasePart") then return false, "summon podium unavailable" end
-	local distance = (root.Position - button.Position).Magnitude
-	if not forcePosition and distance <= math.max(1, prompt.MaxActivationDistance - 0.5) then
-		Runtime.SummonStage = "InRange"
-		return true
-	end
-
 	local forward = Vector3.new(button.CFrame.LookVector.X, 0, button.CFrame.LookVector.Z)
 	if forward.Magnitude < 0.01 then forward = Vector3.new(0, 0, -1) else forward = forward.Unit end
 	local target = button.Position + forward * 2 + Vector3.new(0, 3, 0)
 	local facing = Vector3.new(button.Position.X, target.Y, button.Position.Z)
+	local distance = (root.Position - button.Position).Magnitude
+	local targetDistance = (root.Position - target).Magnitude
+	if not forcePosition and distance <= math.max(1, prompt.MaxActivationDistance - 0.5) and targetDistance <= 1.5 then
+		Runtime.SummonStage = "InRange"
+		Runtime.SummonPositioned = true
+		return true
+	end
+
 	root.CFrame = CFrame.lookAt(target, facing)
 	task.wait(0.12)
 	Runtime.SummonStage = "Positioned"
@@ -591,6 +593,7 @@ Hydra:CreateUniversalInfo(Window, {
 	},
 	VersionLabel = GAME_TITLE .. " v" .. SCRIPT_VERSION,
 	Changelog = {
+		"Added persistent summon-position recovery",
 		"Fixed saved-config autoload",
 		"Added server-synced auto summon timing",
 		"Added owned-plot positioning and range recovery",
@@ -717,12 +720,16 @@ task.spawn(function()
 				local blocked = Runtime:IsTravelBusy()
 				blocked = blocked or (flag("summon.pauseWhileFighting", true) and isFighting())
 				blocked = blocked or (flag("summon.stopFull", true) and inventoryFull(numberFlag("buy.inventoryBuffer", 0)))
-				if not blocked and os.clock() >= Runtime.NextRollAt then
-					Runtime.NextRollAt = os.clock() + serverSummonCooldown() + 0.03
-					local ok, problem = fireSummonPrompt()
-					if not ok then
-						Runtime.NextRollAt = os.clock() + 1
-						warn("Hydra summon failed: " .. tostring(problem))
+				if not blocked then
+					local prompt = getSummonPrompt()
+					if prompt and prompt.Enabled then moveIntoSummonRange(prompt, not Runtime.SummonPositioned) end
+					if os.clock() >= Runtime.NextRollAt then
+						Runtime.NextRollAt = os.clock() + serverSummonCooldown() + 0.03
+						local ok, problem = fireSummonPrompt()
+						if not ok then
+							Runtime.NextRollAt = os.clock() + 1
+							warn("Hydra summon failed: " .. tostring(problem))
+						end
 					end
 				end
 			end
