@@ -1,6 +1,6 @@
 --!nocheck
 
-local VERSION = "0.7.6"
+local VERSION = "0.7.8"
 local GUI_NAME = "HydraUI"
 
 local Players = game:GetService("Players")
@@ -1094,6 +1094,7 @@ function Window:_refreshNotifications()
 end
 
 function Window:_refreshNotificationBadge()
+	if not self.NotificationButton then return end
 	local count = self.UnreadNotifications or 0
 	self.NotificationButton.Image = count > 0 and Assets.Icons.NotificationUnread or Assets.Icons.Notification
 	self.NotificationButton.ImageColor3 = Color3.new(1, 1, 1)
@@ -1131,42 +1132,23 @@ function Window:SetMinimized(minimized)
 	if self.Minimized == minimized then return end
 	self.Minimized = minimized
 	if minimized and self.NotificationsOpen then self:SetNotificationsOpen(false) end
-	self.MinimizeToken = (self.MinimizeToken or 0) + 1
-	local token = self.MinimizeToken
-	local function contentVisible(visible)
-		self.Nav.Visible = visible
-		self.Pages.Visible = visible
-		self.MainHeader.Visible = visible
-		self.SeparatorOverlay.Visible = visible
-		self.MinimizeButton.Visible = visible
-		self.NotificationButton.Visible = visible
-		self.BrandTitle.Visible = visible
-		self.BrandSubtitle.Visible = visible and self.HasSubtitle
-	end
 	if minimized then
-		self.ExpandedPosition = self.Root.Position
-		contentVisible(false)
-		self.RootStroke.Transparency = 0
-		self.RestoreHitbox.Visible = true
-		self.Sidebar.Size = UDim2.fromScale(1, 1)
-		self.Brand.Size = UDim2.fromScale(1, 1)
-		local position = self.ExpandedPosition
-		local iconPosition = UDim2.new(position.X.Scale, position.X.Offset - 358, position.Y.Scale, position.Y.Offset - 278)
-		animate(self.Logo, 0.2, { Position = UDim2.fromOffset(6, 6), Size = UDim2.fromOffset(52, 52) })
-		animate(self.RootCorner, 0.22, { CornerRadius = UDim.new(0, 18) })
-		animate(self.Root, 0.24, { Position = iconPosition, Size = UDim2.fromOffset(64, 64) })
+		local bindName = typeof(self.ToggleKey) == "EnumItem" and self.ToggleKey.Name or tostring(self.ToggleKey or "RightShift")
+		bindName = string.gsub(bindName, "Enum.KeyCode.", "")
+		self.Visible = false
+		self.Root.Visible = false
+		self.SeparatorOverlay.Visible = false
+		Hydra:Notify({
+			Title = "Hydra hidden",
+			Message = "Press " .. bindName .. " to bring Hydra back up.",
+			Duration = 4,
+		})
 	else
-		self.RestoreHitbox.Visible = false
-		self.RootStroke.Transparency = 1
-		animate(self.Logo, 0.2, { Position = UDim2.fromOffset(10, 7), Size = UDim2.fromOffset(48, 48) })
-		animate(self.RootCorner, 0.22, { CornerRadius = UDim.new(0, 14) })
-		animate(self.Root, 0.24, { Position = self.ExpandedPosition or centeredPixelPosition(), Size = UDim2.fromOffset(780, 620) })
-		task.delay(0.25, function()
-			if self.MinimizeToken ~= token or self.Minimized then return end
-			self.Sidebar.Size = UDim2.new(0, 226, 1, 0)
-			self.Brand.Size = UDim2.new(0, 226, 0, 62)
-			contentVisible(true)
-		end)
+		self.Visible = true
+		self.Root.GroupTransparency = 0
+		self.Scale.Scale = 1
+		self.Root.Visible = true
+		self.SeparatorOverlay.Visible = true
 	end
 end
 
@@ -1503,6 +1485,7 @@ function Hydra:CreateConfigManager(section, options)
 		DefaultName = "default",
 		FlagPrefix = "hydra.config",
 		Notify = true,
+		AutoLoad = true,
 	}, options)
 	local directory = options.Directory
 	local prefix = options.FlagPrefix
@@ -1590,10 +1573,15 @@ function Hydra:CreateConfigManager(section, options)
 			if enabled then
 				if not name then manager.Autoload:Set(false, true) notify("Autoload failed", "select a saved config") return end
 				ok, problem = self:SetAutoloadConfig(name, directory)
+				if ok then
+					ok, problem = manager:Load(name)
+					if not ok then self:ClearAutoloadConfig(directory) end
+				end
 			else
 				ok, problem = self:ClearAutoloadConfig(directory)
 			end
 			if not ok then manager.Autoload:Set(not enabled, true) notify("Autoload failed", problem) end
+			if ok and enabled then notify("Autoload loaded", name) end
 		end,
 	})
 
@@ -1609,14 +1597,6 @@ function Hydra:CreateConfigManager(section, options)
 		local ok, problem, name = manager:Save(true)
 		notify(ok and "Configuration overwritten" or "Overwrite failed", ok and name or problem)
 	end })
-	section:AddButton({ Name = "Duplicate as name", ButtonText = "COPY", Callback = function()
-		local source = manager.Selected:Get()
-		local target = cleanConfigName(manager.Name:Get())
-		local ok, problem
-		if source then ok, problem = Hydra:DuplicateConfig(directory, source, target) else ok, problem = false, "select a saved config" end
-		if ok then manager:Refresh(target) end
-		notify(ok and "Configuration duplicated" or "Duplicate failed", ok and target or problem)
-	end })
 	section:AddButton({ Name = "Rename to name", ButtonText = "RENAME", Callback = function()
 		local source = manager.Selected:Get()
 		local target = cleanConfigName(manager.Name:Get())
@@ -1629,16 +1609,14 @@ function Hydra:CreateConfigManager(section, options)
 		local ok, problem, name = manager:Delete()
 		notify(ok and "Configuration deleted" or "Delete failed", ok and name or problem)
 	end })
-	section:AddButton({ Name = "Reset controls", ButtonText = "RESET", Callback = function()
-		Hydra:ResetConfig(saveOptions)
-		notify("Controls reset", "Defaults restored")
-	end })
-	section:AddButton({ Name = "Refresh config list", ButtonText = "REFRESH", Callback = function()
-		local configs = manager:Refresh()
-		notify("Config list refreshed", tostring(#configs) .. " saved")
-	end })
-
-	manager:Refresh(self:GetAutoloadConfig(directory))
+	local autoloadName = self:GetAutoloadConfig(directory)
+	manager:Refresh(autoloadName)
+	if options.AutoLoad and autoloadName then
+		task.defer(function()
+			local ok, problem, name = manager:Load(autoloadName)
+			notify(ok and "Autoload complete" or "Autoload failed", ok and name or problem)
+		end)
+	end
 	return manager
 end
 
@@ -1701,11 +1679,6 @@ function Hydra:CreateWindow(options)
 		ResampleMode = Enum.ResamplerMode.Default, ScaleType = Enum.ScaleType.Fit, Size = UDim2.fromOffset(48, 48),
 	})
 	logo.Parent = brand
-	local restoreHitbox = make("TextButton", {
-		AutoButtonColor = false, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
-		Text = "", Visible = false, ZIndex = 10,
-	})
-	restoreHitbox.Parent = brand
 	local brandTitle = make("TextLabel", {
 		BackgroundTransparency = 1, Position = UDim2.fromOffset(64, hasSubtitle and 9 or 19), Size = UDim2.new(1, -112, 0, 23),
 		Font = Enum.Font.GothamBold, Text = options.Title, TextColor3 = C.Text, TextSize = 17, TextXAlignment = Enum.TextXAlignment.Left,
@@ -1729,7 +1702,7 @@ function Hydra:CreateWindow(options)
 	})
 	pageTitle.Parent = mainHeader
 	local searchShell = make("Frame", {
-		BackgroundColor3 = C.SurfaceAlt, Position = UDim2.new(1, -268, 0, 13), Size = UDim2.fromOffset(184, 36),
+		BackgroundColor3 = C.SurfaceAlt, Position = UDim2.new(1, -268, 0, 13), Size = UDim2.fromOffset(220, 36),
 	}, { corner(10), stroke(C.Line, 0) })
 	searchShell.Parent = mainHeader
 	icon(searchShell, Assets.Icons.Search, 18, UDim2.fromOffset(11, 9), C.Muted)
@@ -1739,7 +1712,6 @@ function Hydra:CreateWindow(options)
 		Text = "", TextColor3 = C.Text, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
 	})
 	searchBox.Parent = searchShell
-	local notificationButton = iconButton(mainHeader, Assets.Icons.Notification, UDim2.new(1, -76, 0, 16), "Notifications")
 	local minimizeButton = iconButton(mainHeader, Assets.Icons.Minimize, UDim2.new(1, -40, 0, 16), "Minimize")
 	local horizontalRule = make("Path2D", {
 		Closed = false, Color3 = C.LineStrong, Thickness = 1, Transparency = 0, ZIndex = 4,
@@ -1796,12 +1768,12 @@ function Hydra:CreateWindow(options)
 		SeparatorOverlay = separatorOverlay, SeparatorScale = separatorScale,
 		HorizontalRule = horizontalRule, OutlinePath = outlinePath,
 		Brand = brand, Nav = nav, MainHeader = mainHeader, PageTitle = pageTitle,
-		BrandTitle = brandTitle, BrandSubtitle = brandSubtitle, HasSubtitle = hasSubtitle, Logo = logo, RestoreHitbox = restoreHitbox,
-		SearchBox = searchBox, NotificationButton = notificationButton, MinimizeButton = minimizeButton, Pages = pages,
+		BrandTitle = brandTitle, BrandSubtitle = brandSubtitle, HasSubtitle = hasSubtitle, Logo = logo,
+		SearchBox = searchBox, MinimizeButton = minimizeButton, Pages = pages,
 		NotificationPanel = notificationPanel, NotificationList = notificationList, NotificationEmpty = notificationEmpty,
 		ClearNotifications = clearNotifications, NotificationsOpen = false, UnreadNotifications = 0,
 		ModalLayer = modalLayer, Tabs = {}, Searchables = {}, Cleaner = Cleaner.new(),
-		Visible = true, Minimized = false, ToggleKey = options.ToggleKey,
+		Visible = true, Minimized = false, ToggleKey = options.ToggleKey, ToggleKeyDown = false,
 	}, Window)
 	self.Cleaner:Add(window.Cleaner)
 	table.insert(self.Windows, window)
@@ -1814,9 +1786,6 @@ function Hydra:CreateWindow(options)
 		separatorOverlay.Size = root.Size
 	end))
 	window.Cleaner:Add(searchBox:GetPropertyChangedSignal("Text"):Connect(function() window:_applySearch() end))
-	window.Cleaner:Add(notificationButton.Activated:Connect(function()
-		window:SetNotificationsOpen(not window.NotificationsOpen)
-	end))
 	window.Cleaner:Add(clearNotifications.Activated:Connect(function()
 		table.clear(Hydra.NotificationHistory)
 		for _, openWindow in ipairs(Hydra.Windows) do
@@ -1829,37 +1798,6 @@ function Hydra:CreateWindow(options)
 	window.Cleaner:Add(minimizeButton.Activated:Connect(function() window:SetMinimized(true) end))
 	window:_refreshNotifications()
 	window:_refreshNotificationBadge()
-	local iconDragging = false
-	local iconMoved = false
-	local iconOrigin
-	local iconStart
-	window.Cleaner:Add(restoreHitbox.InputBegan:Connect(function(input)
-		if not window.Minimized then return end
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			iconDragging = true
-			iconMoved = false
-			iconOrigin = input.Position
-			iconStart = root.Position
-		end
-	end))
-	window.Cleaner:Add(UserInputService.InputChanged:Connect(function(input)
-		if not iconDragging or not window.Minimized then return end
-		if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
-		local delta = input.Position - iconOrigin
-		if delta.Magnitude >= 4 then iconMoved = true end
-		root.Position = UDim2.new(iconStart.X.Scale, iconStart.X.Offset + delta.X, iconStart.Y.Scale, iconStart.Y.Offset + delta.Y)
-	end))
-	window.Cleaner:Add(UserInputService.InputEnded:Connect(function(input)
-		if not iconDragging then return end
-		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-		iconDragging = false
-		if iconMoved then
-			local position = root.Position
-			window.ExpandedPosition = UDim2.new(position.X.Scale, position.X.Offset + 358, position.Y.Scale, position.Y.Offset + 278)
-		else
-			window:SetMinimized(false)
-		end
-	end))
 	window.Cleaner:Add(UserInputService.InputBegan:Connect(function(input, processed)
 		if window.CapturingKeybind then
 			if input.KeyCode ~= Enum.KeyCode.Unknown then
@@ -1867,13 +1805,20 @@ function Hydra:CreateWindow(options)
 			end
 			return
 		end
-		if processed then return end
 		if input.KeyCode == window.ToggleKey then
-			if window.Minimized then window:SetMinimized(false) else window:Toggle() end
+			if window.ToggleKeyDown then return end
+			window.ToggleKeyDown = true
+			if window.Minimized then window:SetMinimized(false)
+			elseif not processed then window:Toggle() end
+			return
 		end
+		if processed then return end
 		for _, control in pairs(Hydra.Controls) do
 			if typeof(control.Value) == "EnumItem" and control.Value == input.KeyCode then safeCall(control.Callback, input.KeyCode) end
 		end
+	end))
+	window.Cleaner:Add(UserInputService.InputEnded:Connect(function(input)
+		if input.KeyCode == window.ToggleKey then window.ToggleKeyDown = false end
 	end))
 	task.defer(function()
 		animate(root, 0.24, { GroupTransparency = 0 })
