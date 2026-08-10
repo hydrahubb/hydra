@@ -1,7 +1,7 @@
 --!nocheck
 
 local TARGET_GAME_ID = 10298144467
-local SCRIPT_VERSION = "0.1.24"
+local SCRIPT_VERSION = "0.1.25"
 local GAME_TITLE = "Roll Anime to Fight!"
 local LIBRARY_URL = "https://raw.githubusercontent.com/hydrahubb/hydra/refs/heads/main/library"
 
@@ -257,27 +257,39 @@ local function getSummonPrompt()
 	return prompt and prompt:IsA("ProximityPrompt") and prompt or nil
 end
 
+local function getLocalSpawnCFrame()
+	Runtime.SummonStage = "ResolveLocalSpawn"
+	local plot = getPlayerPlot()
+	local misc = plot and plot:FindFirstChild("Misc")
+	local spawn = misc and misc:FindFirstChild("Spawn")
+	if spawn and spawn:IsA("Attachment") then return spawn.WorldCFrame end
+	if spawn and spawn:IsA("BasePart") then return spawn.CFrame end
+	return nil
+end
+
 local function moveIntoSummonRange(prompt, forcePosition)
 	Runtime.SummonStage = "ResolveMovement"
 	local character = LocalPlayer.Character
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	local button = prompt.Parent
-	if not root or not button or not button:IsA("BasePart") then return false, "summon podium unavailable" end
-	local forward = Vector3.new(button.CFrame.LookVector.X, 0, button.CFrame.LookVector.Z)
+	local spawnCFrame = getLocalSpawnCFrame()
+	if not root or not button or not button:IsA("BasePart") then return false, "summon prompt unavailable" end
+	if not spawnCFrame then return false, "local summon spawn unavailable" end
+	local forward = Vector3.new(spawnCFrame.LookVector.X, 0, spawnCFrame.LookVector.Z)
 	if forward.Magnitude < 0.01 then forward = Vector3.new(0, 0, -1) else forward = forward.Unit end
-	local target = button.Position + forward * 2 + Vector3.new(0, 3, 0)
-	local facing = Vector3.new(button.Position.X, target.Y, button.Position.Z)
+	local target = spawnCFrame.Position + forward + Vector3.new(0, 3, 0)
+	local facing = target + forward
 	local distance = (root.Position - button.Position).Magnitude
 	local targetDistance = (root.Position - target).Magnitude
 	if not forcePosition and distance <= math.max(1, prompt.MaxActivationDistance - 0.5) and targetDistance <= 1.5 then
-		Runtime.SummonStage = "InRange"
+		Runtime.SummonStage = "AtLocalSpawn"
 		Runtime.SummonPositioned = true
 		return true
 	end
 
 	root.CFrame = CFrame.lookAt(target, facing)
 	task.wait(0.12)
-	Runtime.SummonStage = "Positioned"
+	Runtime.SummonStage = "LocalSpawnPositioned"
 	local positioned = (root.Position - button.Position).Magnitude <= prompt.MaxActivationDistance
 	Runtime.SummonPositioned = positioned
 	return positioned, "summon prompt remained out of range"
@@ -593,7 +605,7 @@ Hydra:CreateUniversalInfo(Window, {
 	},
 	VersionLabel = GAME_TITLE .. " v" .. SCRIPT_VERSION,
 	Changelog = {
-		"Added persistent summon-position recovery",
+		"Added persistent local-spawn summon positioning",
 		"Fixed saved-config autoload",
 		"Added server-synced auto summon timing",
 		"Added owned-plot positioning and range recovery",
